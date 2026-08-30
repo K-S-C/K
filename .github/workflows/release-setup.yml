@@ -1,0 +1,116 @@
+name: Build and Release Installers
+
+on:
+  push:
+    tags:
+      - 'v*'             # triggers on tags like v1.0.0, v2.0, etc.
+
+permissions:
+  contents: write        # required to upload release assets
+
+jobs:
+  # ─── Windows ──────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # The binary is named k.exe – Inno Setup expects it in target\release\
+      # The installer.iss already references target\release\k.exe
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Build Windows installer (K-Setup.exe)
+        run: ISCC.exe installer.iss
+
+      - name: Upload installer to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: K-Setup.exe
+
+  # ─── macOS ────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle
+
+      - name: Build .app bundle
+        run: cargo bundle --release
+
+      - name: Create macOS .pkg installer (unsigned)
+        run: |
+          APP_PATH="target/release/bundle/osx/K Language.app"
+          PKG_ID="com.nodexar.k"
+          VERSION="1.0.0"   # Replace with dynamic version if needed
+
+          # Component package (no scripts folder required)
+          pkgbuild --root "$APP_PATH" \
+                   --identifier "$PKG_ID" \
+                   --version "$VERSION" \
+                   --install-location "/Applications/K Language.app" \
+                   K-Language-Component.pkg
+
+          # Distribution package (unsigned – user will get a security warning)
+          productbuild --package K-Language-Component.pkg \
+                       --identifier "$PKG_ID" \
+                       --version "$VERSION" \
+                       K-Installer.pkg
+
+      - name: Upload installer to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: K-Installer.pkg
+
+  # ─── Linux ────────────────────────────────────────────
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # The binary is named k – rename to match deb asset definition
+      - name: Rename binary for Debian package
+        run: mv target/release/k target/release/k-idle-linux
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Prepare desktop entry
+        run: |
+          mkdir -p target/debian/usr/share/applications/
+          cp k-language.desktop target/debian/usr/share/applications/
+
+      - name: Build .deb package
+        run: cargo deb
+
+      - name: Upload .deb to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: target/debian/*.deb
