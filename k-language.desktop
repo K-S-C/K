@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=K v1
+Comment=Deep Learning IDE
+Exec=k-language gui
+Icon=k-language
+Terminal=false
+Type=Application
+Categories=Development;IDE;
+MimeType=text/x-k;

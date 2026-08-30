@@ -1,0 +1,49 @@
+[package]
+name = "k"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "K - a self-contained, general-purpose programming language with first-class matrix syntax and a built-in IDE."
+
+[dependencies]
+eframe = "0.24.1"
+image = "0.24"
+rustyline = "14.0"
+rfd = "0.14"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "windef", "wincon", "fileapi", "handleapi", "processenv", "winbase", "winnt"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
+[build-dependencies]
+winres = "0.1"
+
+# macOS .app bundle
+[package.metadata.bundle]
+name = "K Language"
+identifier = "com.nodexar.k"
+icon = ["src/k-logo.png"]
+category = "Developer Tool"
+
+# Linux .deb
+[package.metadata.deb]
+name = "k-language"
+maintainer = "Aswanth R <aswanthr82@gmail.com>"
+copyright = "2026 NodeX-AR"
+section = "devel"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/k", "usr/bin/k", "755"],
+    ["src/k-logo.png", "usr/share/pixmaps/k-language.png", "644"],
+]
+extended-description = """\
+K is a self-contained, general-purpose programming language: variables, \
+functions, closures, classes, error handling, and matrix math (@) as \
+built-in syntax rather than a library. Ships as a single binary with no \
+runtime dependencies to install first.
+"""
