@@ -15,9 +15,9 @@ PrivilegesRequired=admin
 Source: "target\release\k.exe"; DestDir: "{app}"
 
 [Icons]
-Name: "{group}\K Language"; Filename: "{app}\k.exe"
+Name: "{group}\K Language"; Filename: "{app}\k.exe"; Parameters: "gui"
 Name: "{group}\Uninstall K"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\K Language"; Filename: "{app}\k.exe"
+Name: "{commondesktop}\K Language"; Filename: "{app}\k.exe"; Parameters: "gui"
 
 [Registry]
 Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; \
@@ -29,7 +29,7 @@ Root: HKCR; Subkey: "KLanguageFile\DefaultIcon"; ValueType: string; ValueData: "
 Root: HKCR; Subkey: "KLanguageFile\shell\open\command"; ValueType: string; ValueData: """{app}\k.exe"" gui ""%1"""
 
 [Run]
-Filename: "{app}\k.exe"; Description: "Launch K Language"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\k.exe"; Parameters: "gui"; Description: "Launch K Language"; Flags: postinstall nowait skipifsilent
 
 [Code]
 function NeedsAddPath(Param: string): boolean;
