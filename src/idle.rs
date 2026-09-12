@@ -23,7 +23,7 @@ pub fn launch() {
         ..Default::default()
     };
 
-    eframe::run_native("K IDE", options, Box::new(|_cc| Box::new(KIdeApp::default()))).ok();
+    eframe::run_native("K Language IDE", options, Box::new(|_cc| Box::new(KIdeApp::default()))).ok();
 }
 
 /// Lex, parse, compile, and run — every stage returns its error as text
@@ -51,6 +51,52 @@ fn looks_like_error(output: &str) -> bool {
         || output.starts_with("Compile error")
         || output.contains("Traceback")
         || output.contains("Runtime error")
+}
+
+/// Net change in brace depth contributed by one line, ignoring anything
+/// inside a string literal or after a `//` comment marker — so a `{` typed
+/// inside a string or a comment doesn't throw off indentation.
+fn net_brace_change(line: &str) -> i32 {
+    let mut net = 0i32;
+    let mut chars = line.chars().peekable();
+    let mut in_string: Option<char> = None;
+    while let Some(c) = chars.next() {
+        if let Some(q) = in_string {
+            if c == '\\' { chars.next(); continue; }
+            if c == q { in_string = None; }
+            continue;
+        }
+        match c {
+            '"' | '\'' => in_string = Some(c),
+            '/' if chars.peek() == Some(&'/') => break, // rest of the line is a comment
+            '{' => net += 1,
+            '}' => net -= 1,
+            _ => {}
+        }
+    }
+    net
+}
+
+/// Re-indents the whole buffer from scratch, purely from `{`/`}` nesting:
+/// each line gets `4 * depth` leading spaces, where a line that itself
+/// starts with `}` is dedented one level before the depth for that line
+/// is applied. K has no significant whitespace (blocks are `{ }`, not
+/// indentation), so this only affects how the source *looks* — it can
+/// never change what a script does.
+fn reindent(code: &str) -> String {
+    let mut depth: i32 = 0;
+    let mut out_lines: Vec<String> = Vec::new();
+    for raw_line in code.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            out_lines.push(String::new());
+            continue;
+        }
+        let this_depth = if trimmed.starts_with('}') { (depth - 1).max(0) } else { depth };
+        out_lines.push(format!("{}{}", "    ".repeat(this_depth as usize), trimmed));
+        depth = (depth + net_brace_change(trimmed)).max(0);
+    }
+    out_lines.join("\n")
 }
 
 const KEYWORDS: &[&str] = &[
@@ -220,7 +266,14 @@ impl KIdeApp {
         if self.dirty { format!("{} •", base) } else { base }
     }
 
+    fn reindent_now(&mut self) {
+        self.code = reindent(&self.code);
+        self.dirty = true;
+        self.status = "Re-indented.".into();
+    }
+
     fn run(&mut self) {
+        self.code = reindent(&self.code);
         self.output = run_code(&self.code);
         self.last_run_ok = Some(!looks_like_error(&self.output));
         self.status = if self.last_run_ok == Some(true) { "Ran successfully.".into() } else { "Finished with an error.".into() };
@@ -249,6 +302,7 @@ impl KIdeApp {
     }
 
     fn save_file(&mut self) {
+        self.code = reindent(&self.code);
         let path = match &self.file_path {
             Some(p) => Some(p.clone()),
             None => rfd::FileDialog::new().add_filter("K source", &["k"]).set_file_name("untitled.k").save_file(),
@@ -257,6 +311,7 @@ impl KIdeApp {
     }
 
     fn save_file_as(&mut self) {
+        self.code = reindent(&self.code);
         let path = rfd::FileDialog::new().add_filter("K source", &["k"]).set_file_name("untitled.k").save_file();
         self.write_to(path);
     }
@@ -279,18 +334,20 @@ impl eframe::App for KIdeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_visuals(if self.dark_mode { egui::Visuals::dark() } else { egui::Visuals::light() });
 
-        let (run_pressed, save_pressed, open_pressed, new_pressed) = ctx.input(|i| {
+        let (run_pressed, save_pressed, open_pressed, new_pressed, indent_pressed) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::F5),
                 i.modifiers.command && i.key_pressed(egui::Key::S),
                 i.modifiers.command && i.key_pressed(egui::Key::O),
                 i.modifiers.command && i.key_pressed(egui::Key::N),
+                i.modifiers.command && i.key_pressed(egui::Key::I),
             )
         });
         if run_pressed { self.run(); }
         if save_pressed { self.save_file(); }
         if open_pressed { self.open_file(); }
         if new_pressed { self.new_file(); }
+        if indent_pressed { self.reindent_now(); }
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -302,6 +359,7 @@ impl eframe::App for KIdeApp {
                 });
                 ui.menu_button("Run", |ui| {
                     if ui.button("Run                       F5").clicked() { self.run(); ui.close_menu(); }
+                    if ui.button("Re-indent Code      Ctrl+I").clicked() { self.reindent_now(); ui.close_menu(); }
                     if ui.button("Clear Output").clicked() { self.output.clear(); ui.close_menu(); }
                 });
                 ui.menu_button("View", |ui| {
@@ -318,7 +376,8 @@ impl eframe::App for KIdeApp {
             ui.horizontal(|ui| {
                 ui.heading("K Language IDE");
                 ui.add_space(16.0);
-                if ui.button("Run  (F5)").clicked() { self.run(); }
+                if ui.button("▶ Run  (F5)").clicked() { self.run(); }
+                if ui.button("Re-indent (Ctrl+I)").clicked() { self.reindent_now(); }
                 if ui.button("Clear Output").clicked() { self.output.clear(); }
             });
         });
@@ -329,9 +388,9 @@ impl eframe::App for KIdeApp {
                 ui.label(format!("{} lines", lines));
                 ui.separator();
                 match self.last_run_ok {
-                    Some(true) => { ui.colored_label(Color32::from_rgb(80, 200, 120), "OK"); }
-                    Some(false) => { ui.colored_label(Color32::from_rgb(220, 90, 90), "Error"); }
-                    None => { ui.label("Not run yet"); }
+                    Some(true) => { ui.colored_label(Color32::from_rgb(80, 200, 120), "● OK"); }
+                    Some(false) => { ui.colored_label(Color32::from_rgb(220, 90, 90), "● Error"); }
+                    None => { ui.label("● Not run yet"); }
                 }
                 ui.separator();
                 ui.label(&self.status);

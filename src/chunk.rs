@@ -59,6 +59,10 @@ pub enum OpCode {
     Instantiate,    // u8 arg count; pop args + class, construct + run init, push instance
     Invoke,         // u16 name const idx, u8 arg count; direct method-call dispatch
     Return,
+    EqUser,         // like Equal, but for user-written '==': errors on dict/instance operands
+                    // instead of silently returning false (Equal itself stays unchecked since
+                    // the compiler also uses it internally for default-parameter detection).
+    NotEqUser,      // same distinction, for user-written '!='
 }
 
 impl OpCode {
@@ -74,7 +78,7 @@ impl OpCode {
             Equal, NotEqual, Greater, GreaterEqual, Less, LessEqual, Add, Subtract, Multiply, Divide,
             Modulo, Power, MatMul, Not, Negate, ToStr, Jump, JumpIfFalse, JumpIfFalsePop, Loop, Call,
             Closure, Class, Inherit, Method, PushTry, PopTry, Throw, Len, GetIterList, Instantiate, Invoke,
-            Return,
+            Return, EqUser, NotEqUser,
         ];
         TABLE[b as usize]
     }

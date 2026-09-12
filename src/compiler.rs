@@ -8,12 +8,14 @@
 use crate::ast::*;
 use crate::chunk::{Chunk, OpCode};
 use crate::value::{FunctionObj, Value};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 struct LocalVar {
     name: String,
     depth: usize,
     slot: u8,
+    is_const: bool,
 }
 
 struct LoopCtx {
@@ -45,7 +47,7 @@ impl FunctionState {
             arity: 0,
         };
         if is_method {
-            fs.locals.push(LocalVar { name: "self".into(), depth: 0, slot: 0 });
+            fs.locals.push(LocalVar { name: "self".into(), depth: 0, slot: 0, is_const: false });
         }
         fs
     }
@@ -55,17 +57,29 @@ enum VarLoc { Local(u8), Upvalue(u8), Global }
 
 pub struct Compiler {
     states: Vec<FunctionState>,
+    /// Names declared with `const` at script (global) scope. Local `const`s
+    /// are tracked per-function on `LocalVar` instead, since they naturally
+    /// go out of scope with the rest of that block's locals.
+    ///
+    /// Scope note: this only sees `const` declarations made within the
+    /// single source text being compiled right now. The REPL compiles each
+    /// line as its own fresh `Compiler` against the same long-lived globals,
+    /// so a `const` declared on one REPL line isn't remembered when
+    /// compiling the next — reassigning it later in the same session won't
+    /// be caught. Within one script file (or one REPL line), it's fully
+    /// enforced.
+    global_consts: HashSet<String>,
 }
 
 impl Compiler {
     pub fn compile_program(stmts: &[Stmt]) -> Result<Rc<FunctionObj>, String> {
-        let mut c = Compiler { states: vec![FunctionState::new("<script>", false)] };
+        let mut c = Compiler { states: vec![FunctionState::new("<script>", false)], global_consts: HashSet::new() };
         c.compile_block(stmts)?;
         c.emit(OpCode::Nil);
         c.emit(OpCode::Return);
         let fs = c.states.pop().unwrap();
         let local_count = fs.next_slot as usize;
-        Ok(Rc::new(FunctionObj { name: fs.name, arity: fs.arity, local_count, chunk: fs.chunk, upvalue_count: fs.upvalues.len() }))
+        Ok(Rc::new(FunctionObj { name: fs.name, arity: fs.arity, required_arity: fs.arity, local_count, chunk: fs.chunk, upvalue_count: fs.upvalues.len() }))
     }
 
     // ---- small helpers operating on the current (innermost) function ----
@@ -98,13 +112,13 @@ impl Compiler {
         self.cur().scope_depth -= 1;
     }
 
-    fn declare_local(&mut self, name: &str) -> Result<u8, String> {
+    fn declare_local(&mut self, name: &str, is_const: bool) -> Result<u8, String> {
         let fs = self.cur();
         if fs.next_slot > 250 { return Err(format!("too many local variables in '{}'", fs.name)); }
         let slot = fs.next_slot as u8;
         fs.next_slot += 1;
         let depth = fs.scope_depth;
-        fs.locals.push(LocalVar { name: name.to_string(), depth, slot });
+        fs.locals.push(LocalVar { name: name.to_string(), depth, slot, is_const });
         Ok(slot)
     }
 
@@ -144,18 +158,31 @@ impl Compiler {
 
     /// Declares `name` for a `let`/`const`/`for`/`catch` binding, choosing
     /// global vs. local storage the same way the rest of the compiler does.
-    fn declare_binding(&mut self, name: &str) -> Result<(), String> {
+    fn declare_binding(&mut self, name: &str, is_const: bool) -> Result<(), String> {
         if self.is_top_level() {
+            if is_const { self.global_consts.insert(name.to_string()); } else { self.global_consts.remove(name); }
             let idx = self.const_str(name);
             self.emit(OpCode::DefineGlobal);
             self.emit_u16(idx);
         } else {
-            let slot = self.declare_local(name)?;
+            let slot = self.declare_local(name, is_const)?;
             self.emit(OpCode::SetLocal);
             self.emit_u8(slot);
             self.emit(OpCode::Pop);
         }
         Ok(())
+    }
+
+    /// Mirrors `resolve_at`'s local → upvalue-chain → global walk, but
+    /// answers "is this binding const" instead of "where does it live".
+    fn is_const_at(&self, level: usize, name: &str) -> bool {
+        if let Some(l) = self.states[level].locals.iter().rev().find(|l| l.name == name) { return l.is_const; }
+        if level == 0 { return self.global_consts.contains(name); }
+        self.is_const_at(level - 1, name)
+    }
+    fn is_const_name(&self, name: &str) -> bool {
+        let level = self.states.len() - 1;
+        self.is_const_at(level, name)
     }
 
     fn get_var(&mut self, name: &str) {
@@ -182,9 +209,32 @@ impl Compiler {
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), String> {
         match stmt {
             Stmt::ExprStmt(e) => { self.compile_expr(e)?; self.emit(OpCode::Pop); }
-            Stmt::Let { name, value } | Stmt::Const { name, value } => {
+            Stmt::Let { name, value } => {
                 self.compile_expr(value)?;
-                self.declare_binding(name)?;
+                self.declare_binding(name, false)?;
+            }
+            Stmt::Const { name, value } => {
+                self.compile_expr(value)?;
+                self.declare_binding(name, true)?;
+            }
+            Stmt::LetDestructure { names, value, is_const } => {
+                self.compile_expr(value)?;
+                // No begin_scope/end_scope here on purpose: that would flip
+                // is_top_level() to false partway through and silently turn
+                // a top-level `let (a, b) = f();` into locals instead of
+                // globals, unlike plain `let`. The scratch slot below just
+                // permanently occupies one extra local slot in this
+                // function — harmless, and its name (with a leading space)
+                // can never collide with anything the user can write.
+                let scratch = self.declare_local(" destructure", false)?;
+                self.emit(OpCode::SetLocal); self.emit_u8(scratch); self.emit(OpCode::Pop);
+                for (i, name) in names.iter().enumerate() {
+                    self.emit(OpCode::GetLocal); self.emit_u8(scratch);
+                    let idx_const = self.const_val(Value::Int(i as i64));
+                    self.emit(OpCode::Constant); self.emit_u16(idx_const);
+                    self.emit(OpCode::GetIndex);
+                    self.declare_binding(name, *is_const)?;
+                }
             }
             Stmt::If { branches, else_branch } => {
                 let mut end_jumps = Vec::new();
@@ -226,12 +276,12 @@ impl Compiler {
                 self.compile_expr(iter)?;
                 self.emit(OpCode::GetIterList);
                 self.begin_scope();
-                let list_slot = self.declare_local(" for_list")?;
+                let list_slot = self.declare_local(" for_list", false)?;
                 self.emit(OpCode::SetLocal); self.emit_u8(list_slot); self.emit(OpCode::Pop);
                 self.emit(OpCode::Constant);
                 let zero = self.const_val(Value::Int(0));
                 self.emit_u16(zero);
-                let idx_slot = self.declare_local(" for_idx")?;
+                let idx_slot = self.declare_local(" for_idx", false)?;
                 self.emit(OpCode::SetLocal); self.emit_u8(idx_slot); self.emit(OpCode::Pop);
 
                 let loop_start = self.here();
@@ -246,7 +296,7 @@ impl Compiler {
                 self.emit(OpCode::GetLocal); self.emit_u8(idx_slot);
                 self.emit(OpCode::GetIndex);
                 self.begin_scope();
-                let var_slot = self.declare_local(var)?;
+                let var_slot = self.declare_local(var, false)?;
                 self.emit(OpCode::SetLocal); self.emit_u8(var_slot); self.emit(OpCode::Pop);
 
                 self.cur().loops.push(LoopCtx { break_jumps: Vec::new(), continue_jumps: Vec::new() });
@@ -270,14 +320,14 @@ impl Compiler {
             }
             Stmt::FuncDecl { name, params, body } => {
                 self.compile_function(name, params, body, false)?;
-                self.declare_binding(name)?;
+                self.declare_binding(name, false)?;
             }
             Stmt::ClassDecl { name, parent, methods } => {
                 if let Some(p) = parent { self.get_var(p); } else { self.emit(OpCode::Nil); }
                 let name_idx = self.const_str(name);
                 self.emit(OpCode::Class);
                 self.emit_u16(name_idx);
-                self.declare_binding(name)?;
+                self.declare_binding(name, false)?;
                 self.get_var(name);
                 for m in methods {
                     if let Stmt::FuncDecl { name: mname, params, body } = m {
@@ -317,7 +367,7 @@ impl Compiler {
                 let skip_catch = self.emit_jump(OpCode::Jump);
                 self.patch_jump(handler);
                 self.begin_scope();
-                let slot = self.declare_local(err_name)?;
+                let slot = self.declare_local(err_name, false)?;
                 self.emit(OpCode::SetLocal); self.emit_u8(slot); self.emit(OpCode::Pop);
                 self.compile_block(catch_block)?;
                 self.end_scope();
@@ -329,6 +379,34 @@ impl Compiler {
                 let stmts = crate::parser::parse(tokens)?;
                 self.compile_block(&stmts)?;
             }
+            Stmt::ImportAs(path, alias) => {
+                let code = std::fs::read_to_string(path).map_err(|e| format!("cannot import '{}': {}", path, e))?;
+                let tokens = crate::lexer::tokenize(&code)?;
+                let stmts = crate::parser::parse(tokens)?;
+                // Same textual inlining as a plain import, but we also note
+                // every top-level name the file declares so we can gather
+                // them into a dict afterward — that's what makes
+                // `alias.someFn()` / `alias.someValue` work.
+                let mut export_names = Vec::new();
+                for s in &stmts {
+                    match s {
+                        Stmt::Let { name, .. } | Stmt::Const { name, .. } => export_names.push(name.clone()),
+                        Stmt::FuncDecl { name, .. } => export_names.push(name.clone()),
+                        Stmt::ClassDecl { name, .. } => export_names.push(name.clone()),
+                        Stmt::LetDestructure { names, .. } => export_names.extend(names.iter().cloned()),
+                        _ => {}
+                    }
+                }
+                self.compile_block(&stmts)?;
+                for name in &export_names {
+                    let key_idx = self.const_str(name);
+                    self.emit(OpCode::Constant); self.emit_u16(key_idx);
+                    self.get_var(name);
+                }
+                self.emit(OpCode::BuildDict);
+                self.emit_u16(export_names.len() as u16);
+                self.declare_binding(alias, false)?;
+            }
         }
         Ok(())
     }
@@ -336,8 +414,9 @@ impl Compiler {
     fn compile_function(&mut self, name: &str, params: &[Param], body: &[Stmt], is_method: bool) -> Result<(), String> {
         self.states.push(FunctionState::new(name, is_method));
         self.cur().arity = params.len();
+        let required_arity = params.iter().filter(|p| p.default.is_none()).count();
         for p in params {
-            let slot = self.declare_local(&p.name)?;
+            let slot = self.declare_local(&p.name, false)?;
             if let Some(default) = &p.default {
                 self.emit(OpCode::GetLocal); self.emit_u8(slot);
                 self.emit(OpCode::Nil);
@@ -360,7 +439,7 @@ impl Compiler {
         let fs = self.states.pop().unwrap();
         let upvalues = fs.upvalues.clone();
         let local_count = fs.next_slot as usize;
-        let func = Rc::new(FunctionObj { name: fs.name, arity: fs.arity, local_count, chunk: fs.chunk, upvalue_count: fs.upvalues.len() });
+        let func = Rc::new(FunctionObj { name: fs.name, arity: fs.arity, required_arity, local_count, chunk: fs.chunk, upvalue_count: fs.upvalues.len() });
         // The constant holds a *template* closure (no upvalues attached yet); the
         // Closure opcode below builds the real runtime closure with actual
         // captured upvalues from it when this code executes.
@@ -418,7 +497,7 @@ impl Compiler {
                 self.emit(match op.as_str() {
                     "+" => OpCode::Add, "-" => OpCode::Subtract, "*" => OpCode::Multiply, "/" => OpCode::Divide,
                     "%" => OpCode::Modulo, "**" => OpCode::Power, "@" => OpCode::MatMul,
-                    "==" => OpCode::Equal, "!=" => OpCode::NotEqual, "<" => OpCode::Less, ">" => OpCode::Greater,
+                    "==" => OpCode::EqUser, "!=" => OpCode::NotEqUser, "<" => OpCode::Less, ">" => OpCode::Greater,
                     "<=" => OpCode::LessEqual, ">=" => OpCode::GreaterEqual,
                     other => return Err(format!("unknown operator '{}'", other)),
                 });
@@ -439,7 +518,11 @@ impl Compiler {
                     self.patch_jump(end);
                 }
             }
-            Expr::Assign { name, value } => { self.compile_expr(value)?; self.set_var(name); }
+            Expr::Assign { name, value } => {
+                if self.is_const_name(name) { return Err(format!("cannot assign to '{}': it was declared with 'const'", name)); }
+                self.compile_expr(value)?;
+                self.set_var(name);
+            }
             Expr::IndexAssign { target, index, value } => {
                 self.compile_expr(target)?;
                 self.compile_expr(index)?;
@@ -485,6 +568,45 @@ impl Compiler {
                     self.emit(OpCode::Call);
                     self.emit_u8(args.len() as u8);
                 }
+            }
+            Expr::Ternary { cond, then_branch, else_branch } => {
+                // Same bytecode shape as an `if` statement's branches, just
+                // producing one value on the stack instead of side effects.
+                self.compile_expr(cond)?;
+                let else_jump = self.emit_jump(OpCode::JumpIfFalse);
+                self.emit(OpCode::Pop);
+                self.compile_expr(then_branch)?;
+                let end_jump = self.emit_jump(OpCode::Jump);
+                self.patch_jump(else_jump);
+                self.emit(OpCode::Pop);
+                self.compile_expr(else_branch)?;
+                self.patch_jump(end_jump);
+            }
+            Expr::Match { subject, arms, default } => {
+                self.compile_expr(subject)?;
+                let scratch = self.declare_local(" match", false)?;
+                self.emit(OpCode::SetLocal); self.emit_u8(scratch); self.emit(OpCode::Pop);
+                let mut end_jumps = Vec::new();
+                for (pattern, body) in arms {
+                    self.emit(OpCode::GetLocal); self.emit_u8(scratch);
+                    self.compile_expr(pattern)?;
+                    self.emit(OpCode::EqUser);
+                    let next_arm = self.emit_jump(OpCode::JumpIfFalse);
+                    self.emit(OpCode::Pop);
+                    self.compile_expr(body)?;
+                    end_jumps.push(self.emit_jump(OpCode::Jump));
+                    self.patch_jump(next_arm);
+                    self.emit(OpCode::Pop);
+                }
+                match default {
+                    Some(body) => self.compile_expr(body)?,
+                    None => {
+                        let msg = self.const_str("no match arm matched, and there was no '_' default");
+                        self.emit(OpCode::Constant); self.emit_u16(msg);
+                        self.emit(OpCode::Throw);
+                    }
+                }
+                for j in end_jumps { self.patch_jump(j); }
             }
         }
         Ok(())

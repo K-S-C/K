@@ -19,12 +19,13 @@ pub enum Token {
     // keywords
     Let, Const, Fn, Return, If, Elif, Else, While, For, In, Break, Continue,
     True, False, Null, Class, New, Try, Catch, Throw, And, Or, Not, Import,
+    As, Match,
     // operators
     Plus, Minus, Star, Slash, Percent, StarStar, At,
-    Assign, PlusAssign, MinusAssign, StarAssign, SlashAssign,
+    Assign, PlusAssign, MinusAssign, StarAssign, SlashAssign, PercentAssign, StarStarAssign,
     Eq, NotEq, Lt, Gt, LtEq, GtEq,
     AndAnd, OrOr, Bang,
-    Arrow,
+    Arrow, FatArrow, Question,
     // punctuation
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
     Comma, Colon, Semi, Dot,
@@ -62,6 +63,20 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, String> {
                 }
                 if pos + 1 >= n { return Err(format!("line {}: unterminated block comment", line)); }
                 pos += 2;
+            }
+            '"' if peek(&chars, pos + 1) == Some('"') && peek(&chars, pos + 2) == Some('"') => {
+                // Triple-quoted string: multi-line, raw (no escape processing) —
+                // ends at the next """.
+                pos += 3;
+                let start = pos;
+                while pos < n && !(chars[pos] == '"' && peek(&chars, pos + 1) == Some('"') && peek(&chars, pos + 2) == Some('"')) {
+                    if chars[pos] == '\n' { line += 1; }
+                    pos += 1;
+                }
+                if pos >= n { return Err(format!("line {}: unterminated triple-quoted string", line)); }
+                let s: String = chars[start..pos].iter().collect();
+                pos += 3;
+                tokens.push(Token::Str(s));
             }
             '"' => {
                 pos += 1;
@@ -102,6 +117,7 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, String> {
                     "class" => Token::Class, "new" => Token::New, "try" => Token::Try,
                     "catch" => Token::Catch, "throw" => Token::Throw, "and" => Token::And,
                     "or" => Token::Or, "not" => Token::Not, "import" => Token::Import,
+                    "as" => Token::As, "match" => Token::Match,
                     _ => Token::Ident(text),
                 });
             }
@@ -112,14 +128,20 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, String> {
                 else { tokens.push(Token::Minus); pos += 1; }
             }
             '*' => {
-                if peek(&chars, pos + 1) == Some('=') { tokens.push(Token::StarAssign); pos += 2; }
+                if peek(&chars, pos + 1) == Some('*') && peek(&chars, pos + 2) == Some('=') { tokens.push(Token::StarStarAssign); pos += 3; }
+                else if peek(&chars, pos + 1) == Some('=') { tokens.push(Token::StarAssign); pos += 2; }
                 else if peek(&chars, pos + 1) == Some('*') { tokens.push(Token::StarStar); pos += 2; }
                 else { tokens.push(Token::Star); pos += 1; }
             }
             '/' => { if peek(&chars, pos + 1) == Some('=') { tokens.push(Token::SlashAssign); pos += 2; } else { tokens.push(Token::Slash); pos += 1; } }
-            '%' => { tokens.push(Token::Percent); pos += 1; }
+            '%' => { if peek(&chars, pos + 1) == Some('=') { tokens.push(Token::PercentAssign); pos += 2; } else { tokens.push(Token::Percent); pos += 1; } }
             '@' => { tokens.push(Token::At); pos += 1; }
-            '=' => { if peek(&chars, pos + 1) == Some('=') { tokens.push(Token::Eq); pos += 2; } else { tokens.push(Token::Assign); pos += 1; } }
+            '?' => { tokens.push(Token::Question); pos += 1; }
+            '=' => {
+                if peek(&chars, pos + 1) == Some('=') { tokens.push(Token::Eq); pos += 2; }
+                else if peek(&chars, pos + 1) == Some('>') { tokens.push(Token::FatArrow); pos += 2; }
+                else { tokens.push(Token::Assign); pos += 1; }
+            }
             '!' => { if peek(&chars, pos + 1) == Some('=') { tokens.push(Token::NotEq); pos += 2; } else { tokens.push(Token::Bang); pos += 1; } }
             '<' => { if peek(&chars, pos + 1) == Some('=') { tokens.push(Token::LtEq); pos += 2; } else { tokens.push(Token::Lt); pos += 1; } }
             '>' => { if peek(&chars, pos + 1) == Some('=') { tokens.push(Token::GtEq); pos += 2; } else { tokens.push(Token::Gt); pos += 1; } }

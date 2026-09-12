@@ -57,13 +57,26 @@ impl Parser {
             Token::Import => {
                 self.advance();
                 let path = match self.advance() { Token::Str(s) => s, other => return Err(format!("expected string path after 'import', got {:?}", other)) };
-                self.match_tok(&Token::Semi);
-                Ok(Stmt::Import(path))
+                if self.match_tok(&Token::As) {
+                    let alias = self.ident()?;
+                    self.match_tok(&Token::Semi);
+                    Ok(Stmt::ImportAs(path, alias))
+                } else {
+                    self.match_tok(&Token::Semi);
+                    Ok(Stmt::Import(path))
+                }
             }
             Token::Return => {
                 self.advance();
                 if self.check(&Token::Semi) || self.check(&Token::RBrace) { self.match_tok(&Token::Semi); Ok(Stmt::Return(None)) }
-                else { let e = self.expression()?; self.match_tok(&Token::Semi); Ok(Stmt::Return(Some(e))) }
+                else {
+                    let mut exprs = vec![self.expression()?];
+                    while self.match_tok(&Token::Comma) { exprs.push(self.expression()?); }
+                    self.match_tok(&Token::Semi);
+                    if exprs.len() == 1 { Ok(Stmt::Return(Some(exprs.into_iter().next().unwrap()))) }
+                    // `return a, b;` packs into a list — `let (a, b) = f();` unpacks it back out.
+                    else { Ok(Stmt::Return(Some(Expr::List(exprs)))) }
+                }
             }
             Token::Break => { self.advance(); self.match_tok(&Token::Semi); Ok(Stmt::Break) }
             Token::Continue => { self.advance(); self.match_tok(&Token::Semi); Ok(Stmt::Continue) }
@@ -74,6 +87,19 @@ impl Parser {
     }
 
     fn let_stmt(&mut self, is_const: bool) -> Result<Stmt, String> {
+        if self.check(&Token::LParen) {
+            self.advance();
+            let mut names = Vec::new();
+            loop {
+                names.push(self.ident()?);
+                if !self.match_tok(&Token::Comma) { break; }
+            }
+            self.expect(Token::RParen, "expected ')' after destructuring names")?;
+            self.expect(Token::Assign, "expected '=' in destructuring binding")?;
+            let value = self.expression()?;
+            self.match_tok(&Token::Semi);
+            return Ok(Stmt::LetDestructure { names, value, is_const });
+        }
         let name = self.ident()?;
         if self.match_tok(&Token::Colon) { self.ident().ok(); } // optional type annotation (documentation only)
         self.expect(Token::Assign, "expected '=' in binding")?;
@@ -175,8 +201,8 @@ impl Parser {
     fn expression(&mut self) -> Result<Expr, String> { self.assignment() }
 
     fn assignment(&mut self) -> Result<Expr, String> {
-        let expr = self.or_expr()?;
-        if matches!(self.peek(), Token::Assign | Token::PlusAssign | Token::MinusAssign | Token::StarAssign | Token::SlashAssign) {
+        let expr = self.ternary()?;
+        if matches!(self.peek(), Token::Assign | Token::PlusAssign | Token::MinusAssign | Token::StarAssign | Token::SlashAssign | Token::PercentAssign | Token::StarStarAssign) {
             let op_tok = self.advance();
             let raw_value = self.assignment()?;
             let value = match op_tok {
@@ -184,6 +210,8 @@ impl Parser {
                 Token::MinusAssign => Expr::Binary { op: "-".into(), left: Box::new(expr.clone()), right: Box::new(raw_value) },
                 Token::StarAssign => Expr::Binary { op: "*".into(), left: Box::new(expr.clone()), right: Box::new(raw_value) },
                 Token::SlashAssign => Expr::Binary { op: "/".into(), left: Box::new(expr.clone()), right: Box::new(raw_value) },
+                Token::PercentAssign => Expr::Binary { op: "%".into(), left: Box::new(expr.clone()), right: Box::new(raw_value) },
+                Token::StarStarAssign => Expr::Binary { op: "**".into(), left: Box::new(expr.clone()), right: Box::new(raw_value) },
                 _ => raw_value,
             };
             return match expr {
@@ -194,6 +222,19 @@ impl Parser {
             };
         }
         Ok(expr)
+    }
+
+    /// `cond ? then : else` — right-associative, so `a ? b : c ? d : e` reads
+    /// as `a ? b : (c ? d : e)`.
+    fn ternary(&mut self) -> Result<Expr, String> {
+        let cond = self.or_expr()?;
+        if self.match_tok(&Token::Question) {
+            let then_branch = self.expression()?;
+            self.expect(Token::Colon, "expected ':' in '?:' expression")?;
+            let else_branch = self.ternary()?;
+            return Ok(Expr::Ternary { cond: Box::new(cond), then_branch: Box::new(then_branch), else_branch: Box::new(else_branch) });
+        }
+        Ok(cond)
     }
 
     fn or_expr(&mut self) -> Result<Expr, String> {
@@ -338,6 +379,32 @@ impl Parser {
                 let params = self.params()?;
                 let body = self.block()?;
                 Ok(Expr::FuncExpr { params, body })
+            }
+            Token::Match => {
+                // Note: if the subject itself looks like a dict literal
+                // ('{'), wrap it in parens — `match {..}` is read as the
+                // opening brace of the match body, same ambiguity most
+                // C-like languages have with match/switch subjects.
+                let subject = self.or_expr()?;
+                self.expect(Token::LBrace, "expected '{' to start match body")?;
+                let mut arms = Vec::new();
+                let mut default = None;
+                while !self.check(&Token::RBrace) {
+                    let is_wildcard = matches!(self.peek(), Token::Ident(s) if s == "_");
+                    if is_wildcard {
+                        self.advance();
+                        self.expect(Token::FatArrow, "expected '=>' after '_' in match")?;
+                        default = Some(Box::new(self.expression()?));
+                    } else {
+                        let pattern = self.expression()?;
+                        self.expect(Token::FatArrow, "expected '=>' in match arm")?;
+                        let body = self.expression()?;
+                        arms.push((pattern, body));
+                    }
+                    if !self.match_tok(&Token::Comma) { break; }
+                }
+                self.expect(Token::RBrace, "expected '}' to close match")?;
+                Ok(Expr::Match { subject: Box::new(subject), arms, default })
             }
             Token::LParen => {
                 let e = self.expression()?;
